@@ -346,6 +346,7 @@ void ftp_retr_sendfile(const char *cmdarg, State *state)
         exit(EXIT_SUCCESS);
       }
 
+      fprintf(stdout, "%s downloaded\n", cmdarg);
       state->message = "226 File send OK.\n";
     } else {
       state->message = "550 Failed to read file.\n";
