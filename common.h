@@ -12,10 +12,13 @@
 #include <netinet/in.h>
 #include <time.h>
 #include <dirent.h>
+#include <glob.h>
 
 #ifndef BSIZE
   #define BSIZE 1024
 #endif
+
+#define WILDCARD_SIGN "*"
 
 typedef struct Port
 {
@@ -108,7 +111,9 @@ void ftp_rmd(Command *, State *);
 void ftp_pasv(Command *, State *);
 void ftp_list(Command *, State *);
 void ftp_retr(Command *, State *);
+void ftp_retr_sendfile(const char *, State *);
 void ftp_stor(Command *, State *);
+void ftp_stor_storefile(const char *, State *);
 void ftp_dele(Command *, State *);
 void ftp_size(Command *, State *);
 void ftp_quit(State *);

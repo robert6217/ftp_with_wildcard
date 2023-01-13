@@ -51,6 +51,13 @@ ssize_t sendfile(int out_fd, int in_fd, off_t * offset, size_t count )
 }
 #endif
 
+glob_t get_wildcard_data(const char *wildcard)
+{
+  glob_t buf;
+  glob(wildcard, GLOB_NOSORT, NULL, &buf);
+  return buf;
+}
+
 /**
  * Generates response message for client
  * @param cmd Current command
@@ -316,42 +323,60 @@ void ftp_mkd(Command *cmd, State *state)
   write_state(state);
 }
 
+void ftp_retr_sendfile(const char *cmdarg, State *state)
+{
+  int fd;
+  int connection;
+  off_t offset = 0;
+  int sent_total = 0;
+  struct stat stat_buf;
+  if(access(cmdarg,R_OK) == 0 && (fd = open(cmdarg,O_RDONLY))) {
+    fstat(fd,&stat_buf);
+    
+    state->message = "150 Opening BINARY mode data connection.\n";
+    
+    write_state(state);
+    
+    connection = accept_connection(state->sock_pasv);
+    close(state->sock_pasv);
+    if(sent_total = sendfile(connection, fd, &offset, stat_buf.st_size)) {
+      
+      if(sent_total != stat_buf.st_size) {
+        perror("ftp_retr:sendfile");
+        exit(EXIT_SUCCESS);
+      }
+
+      state->message = "226 File send OK.\n";
+    } else {
+      state->message = "550 Failed to read file.\n";
+    }
+  } else {
+    state->message = "550 Failed to get file\n";
+  }
+
+  close(fd);
+  close(connection);
+  write_state(state);
+  exit(EXIT_SUCCESS);
+}
+
 /** RETR command */
 void ftp_retr(Command *cmd, State *state)
 {
-
+  char path[BSIZE] = {'\0'};
+  int i;
   if(fork()==0){
-    int connection;
-    int fd;
-    struct stat stat_buf;
-    off_t offset = 0;
-    int sent_total = 0;
     if(state->logged_in){
-
       /* Passive mode */
       if(state->mode == SERVER){
-        if(access(cmd->arg,R_OK)==0 && (fd = open(cmd->arg,O_RDONLY))){
-          fstat(fd,&stat_buf);
-          
-          state->message = "150 Opening BINARY mode data connection.\n";
-          
-          write_state(state);
-          
-          connection = accept_connection(state->sock_pasv);
-          close(state->sock_pasv);
-          if(sent_total = sendfile(connection, fd, &offset, stat_buf.st_size)){
-            
-            if(sent_total != stat_buf.st_size){
-              perror("ftp_retr:sendfile");
-              exit(EXIT_SUCCESS);
-            }
-
-            state->message = "226 File send OK.\n";
-          }else{
-            state->message = "550 Failed to read file.\n";
+        if(strstr(cmd->arg, WILDCARD_SIGN) != NULL) { // find *
+          glob_t full_data = get_wildcard_data(cmd->arg);
+          for(i=0; i < full_data.gl_pathc; i++) {
+            strncpy(path, full_data.gl_pathv[i], BSIZE);
+            ftp_retr_sendfile(path, state);
           }
-        }else{
-          state->message = "550 Failed to get file\n";
+        } else { // can't find *
+          ftp_retr_sendfile(cmd->arg, state);
         }
       }else{
         state->message = "550 Please use PASV instead of PORT.\n";
@@ -359,72 +384,83 @@ void ftp_retr(Command *cmd, State *state)
     }else{
       state->message = "530 Please login with USER and PASS.\n";
     }
-
-    close(fd);
-    close(connection);
-    write_state(state);
-    exit(EXIT_SUCCESS);
   }
   state->mode = NORMAL;
   close(state->sock_pasv);
 }
 
+void ftp_stor_storefile(const char *cmdarg, State *state)
+{
+  int connection, fd;
+  off_t offset = 0;
+  int pipefd[2];
+  int res = 1;
+  const int buff_size = 8192;
+
+  FILE *fp = fopen(cmdarg,"w");
+  if(fp==NULL){
+    /* TODO: write status message here! */
+    perror("ftp_stor:fopen");
+    state->message = "550 No such file or directory.\n";
+  }else if(state->logged_in){
+    if(!(state->mode==SERVER)){
+      state->message = "550 Please use PASV instead of PORT.\n";
+    }
+    /* Passive mode */
+    else{
+      fd = fileno(fp);
+      connection = accept_connection(state->sock_pasv);
+      close(state->sock_pasv);
+      if(pipe(pipefd)==-1)perror("ftp_stor: pipe");
+
+      state->message = "125 Data connection already open; transfer starting.\n";
+      write_state(state);
+
+      /* Using splice function for file receiving.
+        * The splice() system call first appeared in Linux 2.6.17.
+        */
+
+      while ((res = splice(connection, 0, pipefd[1], NULL, buff_size, SPLICE_F_MORE | SPLICE_F_MOVE))>0){
+        splice(pipefd[0], NULL, fd, 0, buff_size, SPLICE_F_MORE | SPLICE_F_MOVE);
+      }
+
+      /* TODO: signal with ABOR command to exit */
+
+      /* Internal error */
+      if(res==-1){
+        perror("ftp_stor: splice");
+        exit(EXIT_SUCCESS);
+      }else{
+        state->message = "226 File send OK.\n";
+      }
+      close(connection);
+      close(fd);
+    }
+  }else{
+    state->message = "530 Please login with USER and PASS.\n";
+  }
+  close(connection);
+  write_state(state);
+  exit(EXIT_SUCCESS);
+}
+
 /** Handle STOR command. TODO: check permissions. */
 void ftp_stor(Command *cmd, State *state)
 {
+  char path[BSIZE] = {'\0'};
+  int i;
   if(fork()==0){
-    int connection, fd;
-    off_t offset = 0;
-    int pipefd[2];
-    int res = 1;
-    const int buff_size = 8192;
 
-    FILE *fp = fopen(cmd->arg,"w");
-
-    if(fp==NULL){
-      /* TODO: write status message here! */
-      perror("ftp_stor:fopen");
-      state->message = "550 No such file or directory.\n";
-    }else if(state->logged_in){
-      if(!(state->mode==SERVER)){
-        state->message = "550 Please use PASV instead of PORT.\n";
+    if(strstr(cmd->arg, WILDCARD_SIGN) != NULL) { // find *
+      glob_t full_data = get_wildcard_data(cmd->arg);
+      for(i=0; i < full_data.gl_pathc; i++) {
+        strncpy(path, full_data.gl_pathv[i], BSIZE);
+        ftp_stor_storefile(path, state);
       }
-      /* Passive mode */
-      else{
-        fd = fileno(fp);
-        connection = accept_connection(state->sock_pasv);
-        close(state->sock_pasv);
-        if(pipe(pipefd)==-1)perror("ftp_stor: pipe");
-
-        state->message = "125 Data connection already open; transfer starting.\n";
-        write_state(state);
-
-        /* Using splice function for file receiving.
-         * The splice() system call first appeared in Linux 2.6.17.
-         */
-
-        while ((res = splice(connection, 0, pipefd[1], NULL, buff_size, SPLICE_F_MORE | SPLICE_F_MOVE))>0){
-          splice(pipefd[0], NULL, fd, 0, buff_size, SPLICE_F_MORE | SPLICE_F_MOVE);
-        }
-
-        /* TODO: signal with ABOR command to exit */
-
-        /* Internal error */
-        if(res==-1){
-          perror("ftp_stor: splice");
-          exit(EXIT_SUCCESS);
-        }else{
-          state->message = "226 File send OK.\n";
-        }
-        close(connection);
-        close(fd);
-      }
-    }else{
-      state->message = "530 Please login with USER and PASS.\n";
+    } else { // can't find *
+      ftp_stor_storefile(cmd->arg, state);
     }
-    close(connection);
-    write_state(state);
-    exit(EXIT_SUCCESS);
+    
   }
   state->mode = NORMAL;
   close(state->sock_pasv);
